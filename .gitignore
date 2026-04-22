@@ -1,0 +1,39 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node (if/when a build step is added)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Python (uv was used to generate icons)
+.venv/
+__pycache__/
+*.pyc
+
+# Extension packaging artifacts
+*.zip
+*.crx
+*.pem
+
+# Generated icons (run scripts/make_icons.py to regenerate)
+icons/
+
+# Local session memory / scratch
+.remember/
+
+# Logs / local state
+*.log
+.env
+.env.local
