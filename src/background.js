@@ -114,16 +114,30 @@ function pump() {
 }
 
 async function startOne(item) {
+  // Reserve the concurrency slot synchronously so a fast pump() loop can't
+  // over-dispatch while tabs.create() is in flight.
+  const slotKey = `slot:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const entry = { item, tabId: null, openedAt: Date.now(), downloadId: null, pending: true };
+  state.active.set(slotKey, entry);
+  await persistState();
+  broadcastProgress();
+
   let tab;
   try {
     tab = await chrome.tabs.create({ url: item.url, active: false });
   } catch (err) {
+    state.active.delete(slotKey);
     handleFailure(item, err?.message || String(err));
+    await persistState();
+    broadcastProgress();
     pump();
     return;
   }
 
-  const entry = { item, tabId: tab.id, openedAt: Date.now(), downloadId: null };
+  // Rekey the slot under the real tab id now that we have one.
+  state.active.delete(slotKey);
+  entry.tabId = tab.id;
+  entry.pending = false;
   state.active.set(tab.id, entry);
   await persistState();
   broadcastProgress();
@@ -175,9 +189,11 @@ chrome.downloads.onCreated.addListener(async (dl) => {
   if (!DOWNLOAD_URL_RE.test(dl.url) && !DOWNLOAD_URL_RE.test(dl.finalUrl || "")) return;
 
   // Match to the oldest active tab that hasn't been paired with a download yet.
+  // Skip pending entries — they don't have a real tab yet.
   let oldestKey = null;
   let oldestEntry = null;
   for (const [tabId, entry] of state.active.entries()) {
+    if (entry.pending) continue;
     if (entry.downloadId != null) continue;
     if (!oldestEntry || entry.openedAt < oldestEntry.openedAt) {
       oldestKey = tabId;
