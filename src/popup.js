@@ -3,10 +3,19 @@ const rescanBtn = document.getElementById("rescan");
 const concurrencyEl = document.getElementById("concurrency");
 const concurrencyValueEl = document.getElementById("concurrency-value");
 const startBtn = document.getElementById("start");
+const retryBtn = document.getElementById("retry-failed");
 const progressEl = document.getElementById("progress-summary");
-const recentEl = document.getElementById("recent");
+const itemsEl = document.getElementById("items");
 
 const CONCURRENCY_PREF_KEY = "concurrency";
+
+const STATUS_ICON = {
+  queued: "·",
+  retrying: "⟲",
+  active: "▶",
+  complete: "✓",
+  failed: "✗",
+};
 
 let links = [];
 let running = false;
@@ -45,6 +54,10 @@ startBtn.addEventListener("click", () => {
       concurrency: Number(concurrencyEl.value),
     });
   }
+});
+
+retryBtn.addEventListener("click", () => {
+  port?.postMessage({ type: "RETRY_FAILED" });
 });
 
 function connectPort() {
@@ -110,35 +123,52 @@ function onProgress(msg) {
   if (msg.total === 0) {
     progressEl.textContent = "Idle";
   } else {
+    const retryingSuffix = msg.retrying ? `, ${msg.retrying} retrying` : "";
     progressEl.textContent =
-      `${msg.done} / ${msg.total} done, ${msg.failed} failed, ${msg.active} active, ${msg.queued} queued`;
+      `${msg.done} / ${msg.total} done, ${msg.failed} failed, ${msg.active} active, ${msg.queued} queued${retryingSuffix}`;
   }
 
-  renderRecent(msg.recent || []);
+  if (msg.failed > 0) {
+    retryBtn.hidden = false;
+    retryBtn.textContent = `Retry failed (${msg.failed})`;
+    retryBtn.disabled = running;
+  } else {
+    retryBtn.hidden = true;
+  }
+
+  renderItems(msg.items || []);
 }
 
-function renderRecent(events) {
-  recentEl.replaceChildren();
-  for (const ev of events) {
+function renderItems(items) {
+  itemsEl.replaceChildren();
+  for (const it of items) {
     const li = document.createElement("li");
+    li.className = `status-${it.status}`;
 
     const icon = document.createElement("span");
-    icon.textContent = ev.status === "complete" ? "✓" : "✗";
-    icon.className = ev.status === "complete" ? "status-complete" : "status-failed";
+    icon.className = "icon";
+    icon.textContent = STATUS_ICON[it.status] ?? "?";
     li.appendChild(icon);
 
     const name = document.createElement("span");
     name.className = "name";
-    name.textContent = ev.filename;
+    name.textContent = it.label;
     li.appendChild(name);
 
-    if (ev.reason) {
+    if (it.attempts > 0 && it.status !== "complete") {
+      const attempts = document.createElement("span");
+      attempts.className = "attempts";
+      attempts.textContent = `×${it.attempts}`;
+      li.appendChild(attempts);
+    }
+
+    if (it.lastReason && (it.status === "failed" || it.status === "retrying")) {
       const reason = document.createElement("span");
       reason.className = "reason";
-      reason.textContent = ev.reason;
+      reason.textContent = it.lastReason;
       li.appendChild(reason);
     }
 
-    recentEl.appendChild(li);
+    itemsEl.appendChild(li);
   }
 }

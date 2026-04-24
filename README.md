@@ -33,16 +33,19 @@ Click **Stop** to cancel in-flight downloads and drain the queue.
 ## How it works
 
 - `src/content.js` scrapes anchors on `takeout.google.com/manage*` whose href points at `takeout.google.com/takeout/download?j=...&i=...` (each one is a Takeout archive part).
-- `src/popup.js` gathers those links and hands them to the service worker.
-- `src/background.js` runs a concurrency-bounded pool: for each item it opens the URL in an inactive `chrome.tabs.create` tab. If the tab receives a file response, Chrome starts the download; the extension correlates the new download back to the source tab via `chrome.downloads.onCreated` and closes the tab. If no download starts within 90s (e.g. the user ignored a password prompt), the tab is closed and the item is retried or marked failed.
+- `src/popup.js` gathers those links and hands them to the service worker, then renders per-item status.
+- `src/background.js` runs a concurrency-bounded pool: for each item it opens the URL in an inactive `chrome.tabs.create` tab. If the tab receives a file response, Chrome starts the download; the extension correlates the new download back to the source item by URL-exact match on `DownloadItem.url` (falling back to oldest-unmatched tab if the redirect already collapsed). A `chrome.alarms` watchdog ticks every 30s to reconcile active downloads against `chrome.downloads.search`, enforce the tab-auth deadline (extending it automatically if the tab is still on `accounts.google.com`), detect stalled downloads (no bytes received for ~90s), and wake items whose retry backoff has elapsed. `chrome.tabs.onRemoved` fails an item fast if the user manually closes its background tab.
 
 Why tabs instead of `chrome.downloads.download`: the `/takeout/download?...` URL returns either a 302 to the signed file URL OR an HTML password-confirmation page. `chrome.downloads.download` saves whatever it gets, so an HTML response becomes a `pwd.htm` file on disk. Navigating a tab to the same URL lets the browser do the right thing with each content-type.
 
 ## Notes
 
-- Takeout signed URLs expire after ~1 week. If downloads fail with 401/403, the export itself has expired — regenerate it from Takeout.
-- Failures retry up to 2 times with a 3s backoff before being marked failed.
-- Worker state persists in `chrome.storage.session`, so a torn-down service worker picks back up from the next `downloads.onChanged` event.
+- Takeout signed URLs expire after ~1 week. If downloads fail with `SERVER_FORBIDDEN`/`SERVER_UNAUTHORIZED`, the export itself has expired — regenerate it from Takeout.
+- Transient failures (`NETWORK_*`, `SERVER_FAILED`, `FILE_FAILED`, `CRASH`, stalls, auth-timeouts) retry up to 6 times with exponential backoff (3s → 6s → 12s → 24s → 48s → 96s, +jitter, capped at 2 min). Permanent failures (403/401, disk full, name too long) skip retries.
+- When Chrome marks an interrupted download as resumable, the extension calls `chrome.downloads.resume()` instead of restarting from zero — FILE_FAILED partway through a multi-GB part is almost always recoverable.
+- Downloads that "complete" with `text/html` mime are recognized as garbage (e.g. a session-expired interstitial with `Content-Disposition: attachment`), erased, and retried instead of claiming success.
+- A "Retry failed" button in the popup re-enqueues any items that gave up, without rescanning the page. The toolbar badge shows `done/total` while downloading, `N✗` on failures, and `✓` when a batch finishes cleanly — so you don't have to leave the popup open to know the run is making progress.
+- Worker state (including per-item attempt counters and tab deadlines) persists in `chrome.storage.session`. The `chrome.alarms` watchdog survives service-worker teardown, so tabs can't be orphaned if the SW is killed mid-run.
 
 ## File layout
 

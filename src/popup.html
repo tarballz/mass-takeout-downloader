@@ -30,8 +30,11 @@
     </section>
 
     <section class="progress">
-      <div id="progress-summary">Idle</div>
-      <ul id="recent"></ul>
+      <div class="progress-row">
+        <div id="progress-summary">Idle</div>
+        <button id="retry-failed" type="button" hidden>Retry failed</button>
+      </div>
+      <ul id="items"></ul>
     </section>
 
     <script src="popup.js"></script>
