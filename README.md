@@ -34,6 +34,8 @@ Click **Stop** to cancel in-flight downloads and drain the queue.
 
 **First run / password prompts**: when the extension isn't sure the session is valid, it opens tabs one at a time (probe mode). The moment a download actually starts, it switches to full concurrency. If Google asks you to re-enter your password, the extension detects the redirect to `accounts.google.com`, auto-focuses that tab, and closes any other sibling tabs that were also pending auth (their items go back to the queue with a "queued behind auth" note). You only confirm your password once; then the queue resumes at the configured concurrency. Closing the auth tab halts the run — click **Start** again to resume.
 
+**Signed URL caching (minimizes re-auth prompts)**: Google's Takeout flow re-challenges your password periodically for every part you request through `/takeout/download?…`. The extension sidesteps this by observing the 302 redirect each part produces (from `/takeout/download?…` → `takeout-download.usercontent.google.com/…?sig=…`) via `chrome.webRequest.onBeforeRedirect`, caching the pre-signed URL in `chrome.storage.local`, and on future dispatches downloading that URL directly via `chrome.downloads.download` — no tab, no redirect, no re-auth check. Signed URLs carry their own auth (the signature) and are valid for several days, so once a part's URL is in the cache, subsequent runs and retries bypass the auth prompt entirely. On run start the extension also issues silent background `HEAD` fetches to pre-populate the cache for parts whose session is already valid.
+
 ## How it works
 
 - `src/content.js` scrapes anchors on `takeout.google.com/manage*` whose href points at `takeout.google.com/takeout/download?j=...&i=...` (each one is a Takeout archive part).

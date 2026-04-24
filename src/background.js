@@ -23,6 +23,18 @@ const WATCHDOG_PERIOD_MIN = 0.5;
 const STATE_KEY = "mtd_state";
 const AUTH_URL_PREFIX = "https://accounts.google.com/";
 
+// Pre-signed URLs from Google's redirect chain bypass the /takeout/download?
+// re-auth check entirely — the signature IS the auth. We cache them in
+// chrome.storage.local and reuse them for direct chrome.downloads.download
+// calls, eliminating tab navigation (and its re-auth exposure) for any item
+// whose URL we've observed.
+const SIGNED_URL_CACHE_KEY = "mtd_signed_urls";
+const SIGNED_URL_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days — URLs expire ~7d
+const PREFETCH_TIMEOUT_MS = 20_000;
+const PREFETCH_CONCURRENCY = 10;
+const TAKEOUT_DL_PREFIX = "https://takeout.google.com/takeout/download";
+const SIGNED_URL_HOST = "https://takeout-download.usercontent.google.com";
+
 const DOWNLOAD_URL_RE =
   /^https:\/\/(takeout-download\.usercontent\.google\.com|takeout\.google\.com\/takeout\/download)/;
 
@@ -76,7 +88,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 async function handlePopupMessage(msg, port) {
-  await ensureRestored();
+  await Promise.all([ensureRestored(), loadSignedUrlCache()]);
   switch (msg?.type) {
     case "START_DOWNLOADS":
       await startDownloads(msg.links, msg.concurrency, {
@@ -114,6 +126,150 @@ function partKey(url) {
 function basename(path) {
   if (!path) return "";
   return path.split(/[\\/]/).pop() || path;
+}
+
+// --- signed URL cache ---
+
+let signedUrlCache = {};
+let signedUrlCacheLoaded = null;
+
+async function loadSignedUrlCache() {
+  if (signedUrlCacheLoaded) return signedUrlCacheLoaded;
+  signedUrlCacheLoaded = (async () => {
+    let stored;
+    try {
+      stored = (await chrome.storage.local.get(SIGNED_URL_CACHE_KEY))[SIGNED_URL_CACHE_KEY];
+    } catch { stored = null; }
+    signedUrlCache = stored && typeof stored === "object" ? stored : {};
+    const now = Date.now();
+    let dirty = false;
+    for (const key of Object.keys(signedUrlCache)) {
+      const entry = signedUrlCache[key];
+      if (!entry || typeof entry !== "object" || !entry.signedUrl || !entry.capturedAt) {
+        delete signedUrlCache[key];
+        dirty = true;
+        continue;
+      }
+      if (now - entry.capturedAt > SIGNED_URL_TTL_MS) {
+        delete signedUrlCache[key];
+        dirty = true;
+      }
+    }
+    if (dirty) await saveSignedUrlCache();
+  })();
+  return signedUrlCacheLoaded;
+}
+
+// Debounced save so a burst of onBeforeRedirect events doesn't thrash storage.
+let saveSignedCacheQueued = false;
+let saveSignedCacheInFlight = null;
+function saveSignedUrlCache() {
+  if (saveSignedCacheInFlight) {
+    saveSignedCacheQueued = true;
+    return saveSignedCacheInFlight;
+  }
+  saveSignedCacheInFlight = (async () => {
+    try {
+      await chrome.storage.local.set({ [SIGNED_URL_CACHE_KEY]: signedUrlCache });
+    } catch {}
+    saveSignedCacheInFlight = null;
+    if (saveSignedCacheQueued) {
+      saveSignedCacheQueued = false;
+      saveSignedUrlCache();
+    }
+  })();
+  return saveSignedCacheInFlight;
+}
+
+function cacheSignedUrl(takeoutUrl, signedUrl) {
+  const key = partKey(takeoutUrl);
+  if (!key) return;
+  signedUrlCache[key] = { signedUrl, capturedAt: Date.now() };
+  saveSignedUrlCache();
+}
+
+function getCachedSignedUrl(takeoutUrl) {
+  const key = partKey(takeoutUrl);
+  if (!key) return null;
+  const entry = signedUrlCache[key];
+  if (!entry) return null;
+  if (Date.now() - entry.capturedAt > SIGNED_URL_TTL_MS) {
+    delete signedUrlCache[key];
+    saveSignedUrlCache();
+    return null;
+  }
+  return entry.signedUrl;
+}
+
+function evictSignedUrl(takeoutUrl) {
+  const key = partKey(takeoutUrl);
+  if (!key) return;
+  if (signedUrlCache[key]) {
+    delete signedUrlCache[key];
+    saveSignedUrlCache();
+  }
+}
+
+// Observe redirects from /takeout/download? → signed usercontent URL and
+// cache them. Fires for both tab-navigated redirects (populated as the run
+// progresses) and SW-initiated prefetch fetches.
+chrome.webRequest.onBeforeRedirect.addListener(
+  (details) => {
+    if (!details.url?.startsWith(TAKEOUT_DL_PREFIX)) return;
+    if (!details.redirectUrl?.startsWith(SIGNED_URL_HOST)) return;
+    cacheSignedUrl(details.url, details.redirectUrl);
+  },
+  { urls: [TAKEOUT_DL_PREFIX + "*"] },
+);
+
+// Silent prefetch: for items without a cached signed URL, issue a HEAD request
+// so Google responds with a 302 to the signed URL (captured by the
+// onBeforeRedirect listener above). Credentials are included because we have
+// host_permissions for takeout.google.com, so the user's existing session
+// cookies ride along. If the session is stale, the redirect goes to
+// accounts.google.com instead — we don't cache, the item just falls back to
+// the tab flow later.
+let prefetchInFlight = null;
+async function prefetchPendingSignedUrls() {
+  if (prefetchInFlight) return prefetchInFlight;
+  prefetchInFlight = (async () => {
+    await loadSignedUrlCache();
+    const targets = state.items
+      .filter(
+        (it) =>
+          (it.status === "queued" || it.status === "retrying") &&
+          !getCachedSignedUrl(it.url),
+      )
+      .slice(0, 200);
+    if (targets.length === 0) return;
+
+    const queue = targets.slice();
+    const workers = [];
+    const fetchOne = async (item) => {
+      try {
+        await Promise.race([
+          fetch(item.url, {
+            credentials: "include",
+            redirect: "manual",
+            method: "HEAD",
+          }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), PREFETCH_TIMEOUT_MS)),
+        ]);
+      } catch {}
+    };
+    for (let i = 0; i < PREFETCH_CONCURRENCY; i++) {
+      workers.push((async () => {
+        while (queue.length > 0) {
+          const item = queue.shift();
+          if (!item) break;
+          if (getCachedSignedUrl(item.url)) continue; // raced with another observer
+          await fetchOne(item);
+        }
+      })());
+    }
+    await Promise.all(workers);
+  })().finally(() => { prefetchInFlight = null; });
+  return prefetchInFlight;
 }
 
 // Query Chrome's download history for completed Takeout parts that still
@@ -207,6 +363,11 @@ async function startDownloads(links, concurrency, options = {}) {
 
   if (hasWork) await ensureWatchdog();
   await persistState();
+  // Kick off a silent prefetch: issue HEAD requests against /takeout/download
+  // for every unqueued item so onBeforeRedirect can capture their signed URLs
+  // into the cache. If the session is still valid, startOne will then take the
+  // direct-download fast path for these items — no tabs, no re-auth.
+  if (hasWork) prefetchPendingSignedUrls();
   if (hasWork) pump();
   broadcastProgress();
 }
@@ -315,9 +476,38 @@ async function startOne(item) {
   item.downloadId = null;
   item.lastBytes = 0;
   item.stallTicks = 0;
+  item.usedCachedUrl = false;
+  item.tabId = null;
   await persistState();
   broadcastProgress();
 
+  // Fast path: if we have a cached pre-signed URL for this part, download it
+  // directly. Bypasses /takeout/download? entirely, so no re-auth check, no
+  // redirect to accounts.google.com, no tab — and no chance of a
+  // USER_CANCELED race. The signed URL carries its own auth.
+  const cachedUrl = getCachedSignedUrl(item.url);
+  if (cachedUrl) {
+    try {
+      const downloadId = await chrome.downloads.download({
+        url: cachedUrl,
+        conflictAction: "uniquify",
+      });
+      if (downloadId != null && item.status === "active") {
+        item.downloadId = downloadId;
+        item.usedCachedUrl = true;
+        item.tabDeadline = null; // no tab to supervise
+        await persistState();
+        broadcastProgress();
+        return;
+      }
+    } catch (err) {
+      // Cached URL rejected pre-flight (malformed, expired, etc). Evict and
+      // fall through to the tab flow, which will also capture a fresh URL.
+      evictSignedUrl(item.url);
+    }
+  }
+
+  // Tab-based flow (current behavior). Used when no cached URL is available.
   let tab;
   try {
     tab = await chrome.tabs.create({ url: item.url, active: false });
@@ -350,7 +540,22 @@ async function handleFailure(item, reason) {
     try { await chrome.tabs.remove(tabId); } catch {}
   }
 
-  const klass = classifyReason(reason);
+  let klass = classifyReason(reason);
+  // If a cached signed URL produced an auth-ish permanent failure, the URL
+  // is stale (past TTL, or the session it was issued for was revoked).
+  // Evict it and treat the failure as transient so we retry via the tab
+  // flow, which will capture a fresh signed URL.
+  if (
+    item.usedCachedUrl &&
+    klass === "permanent" &&
+    (reason === "SERVER_FORBIDDEN" || reason === "SERVER_UNAUTHORIZED")
+  ) {
+    evictSignedUrl(item.url);
+    item.usedCachedUrl = false;
+    klass = "transient";
+    item.lastReason = `${reason} (stale cached url, retrying via tab)`;
+  }
+
   if (klass === "transient" && item.attempts < MAX_RETRIES) {
     item.attempts += 1;
     item.status = "retrying";
@@ -386,25 +591,37 @@ function stableId(url, idx) {
 // --- download event correlation ---
 
 chrome.downloads.onCreated.addListener(async (dl) => {
-  await ensureRestored();
+  await Promise.all([ensureRestored(), loadSignedUrlCache()]);
   if (!DOWNLOAD_URL_RE.test(dl.url) && !DOWNLOAD_URL_RE.test(dl.finalUrl || "")) return;
 
-  // Prefer URL-exact match: Chrome's DownloadItem.url is the pre-redirect URL,
-  // which for Takeout matches our stored item.url byte-for-byte. Every part URL
-  // is unique, so when this matches it's unambiguous — no tab-open-order race.
+  // 1. URL-exact against item.url (tab flow where Chrome reports the
+  //    pre-redirect URL in dl.url). Every part URL is unique.
   let target = null;
   for (const item of state.items) {
     if (item.status !== "active") continue;
-    if (item.tabId == null) continue;
     if (item.downloadId != null) continue;
     if (dl.url === item.url || dl.finalUrl === item.url) {
       target = item;
       break;
     }
   }
-  // Fallback to oldest-unmatched: covers the case where Chrome's url field is
-  // the post-redirect usercontent URL (differs by Chrome version and by
-  // whether the 302 was followed internally).
+  // 2. Cache-based match. For direct downloads the cached signed URL IS dl.url;
+  //    also handles tab flow where Chrome happens to report the post-redirect
+  //    URL in dl.url. Correlating via the cache is unambiguous because each
+  //    cached entry maps 1:1 to a /takeout/download part URL.
+  if (!target && dl.url?.startsWith(SIGNED_URL_HOST)) {
+    for (const item of state.items) {
+      if (item.status !== "active") continue;
+      if (item.downloadId != null) continue;
+      if (getCachedSignedUrl(item.url) === dl.url) {
+        target = item;
+        break;
+      }
+    }
+  }
+  // 3. Positional fallback for tab-flow items only (tabId set). Direct-flow
+  //    items (tabId=null) must not be matched here — their onCreated event
+  //    would otherwise mis-attribute to a parallel tab item.
   if (!target) {
     for (const item of state.items) {
       if (item.status !== "active") continue;
@@ -421,9 +638,12 @@ chrome.downloads.onCreated.addListener(async (dl) => {
 
   // A download actually starting is the trusted signal that session is valid.
   // Close any open auth gate and flip sessionProven so pump() can go full
-  // concurrency.
-  const wasGated = state.authTabId === target.tabId;
-  if (wasGated || !state.sessionProven) {
+  // concurrency. (Require both ids non-null so null===null doesn't falsely
+  // fire for direct-flow items, which have target.tabId === null.)
+  const wasGated =
+    target.tabId != null && state.authTabId != null && state.authTabId === target.tabId;
+  const justProved = wasGated || !state.sessionProven;
+  if (justProved) {
     state.authTabId = null;
     state.authItemId = null;
     state.authSince = null;
@@ -436,6 +656,10 @@ chrome.downloads.onCreated.addListener(async (dl) => {
         it.lastReason = null;
       }
     }
+    // Session is freshly valid — re-run the silent prefetch so remaining
+    // uncached items can take the direct-download fast path instead of
+    // going through a tab (which risks hitting another re-auth).
+    prefetchPendingSignedUrls();
   }
   await persistState();
   broadcastProgress();
@@ -890,7 +1114,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 // Cold-start: restore state, and if a run was in flight, re-arm the watchdog
 // and tick once so orphan tabs past their deadline get cleaned up immediately.
 (async () => {
-  await ensureRestored();
+  await Promise.all([ensureRestored(), loadSignedUrlCache()]);
   const anyInFlight = state.items.some(
     (it) => it.status === "active" || it.status === "queued" || it.status === "retrying",
   );

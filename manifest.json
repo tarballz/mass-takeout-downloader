@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Mass Takeout Downloader",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Download all parts of a Google Takeout export in one click.",
   "minimum_chrome_version": "116",
-  "permissions": ["alarms", "downloads", "storage", "tabs"],
+  "permissions": ["alarms", "downloads", "storage", "tabs", "webRequest"],
   "host_permissions": [
     "https://takeout.google.com/*",
     "https://takeout-download.usercontent.google.com/*"
