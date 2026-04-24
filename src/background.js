@@ -14,12 +14,14 @@ const MAX_RETRIES = 6;
 const BASE_BACKOFF_MS = 3000;
 const MAX_BACKOFF_MS = 120_000;
 const TAB_AUTH_TIMEOUT_MS = 90_000;
+const AUTH_GATE_TIMEOUT_MS = 5 * 60 * 1000; // user has 5 min to enter password
 const STALL_WINDOW_TICKS = 3; // ~90s at 30s tick
 const WATCHDOG_ALARM = "mtd_watchdog";
 // Packed (non-developer) extensions clamp periodInMinutes to a minimum of 0.5
 // (30s). Using 0.5 makes behavior identical in dev and prod.
 const WATCHDOG_PERIOD_MIN = 0.5;
 const STATE_KEY = "mtd_state";
+const AUTH_URL_PREFIX = "https://accounts.google.com/";
 
 const DOWNLOAD_URL_RE =
   /^https:\/\/(takeout-download\.usercontent\.google\.com|takeout\.google\.com\/takeout\/download)/;
@@ -44,10 +46,18 @@ const PERMANENT_REASONS = new Set([
 const USER_CANCEL_REASONS = new Set(["USER_CANCELED", "USER_SHUTDOWN"]);
 
 // state.items is the single source of truth; queued/active/failed are derived.
+// Auth gate: when a tab redirects to accounts.google.com we stop dispatching
+// new tabs, close pending-auth siblings, and wait for the user to complete the
+// password prompt. sessionProven flips true the first time a download actually
+// starts, allowing full-concurrency dispatch.
 const state = {
   limit: 3,
   items: [],
   running: false,
+  sessionProven: false,
+  authTabId: null,
+  authItemId: null,
+  authSince: null,
 };
 
 let popupPort = null;
@@ -69,7 +79,9 @@ async function handlePopupMessage(msg, port) {
   await ensureRestored();
   switch (msg?.type) {
     case "START_DOWNLOADS":
-      await startDownloads(msg.links, msg.concurrency);
+      await startDownloads(msg.links, msg.concurrency, {
+        skipCompleted: !!msg.skipCompleted,
+      });
       break;
     case "STOP_DOWNLOADS":
       await stopDownloads();
@@ -77,44 +89,141 @@ async function handlePopupMessage(msg, port) {
     case "RETRY_FAILED":
       await retryFailed();
       break;
+    case "CHECK_COMPLETED":
+      await handleCheckCompleted(msg.links, port);
+      break;
     case "GET_STATE":
       broadcastProgress(port);
       break;
   }
 }
 
+// Keyed by (jobId, partId) so URL param ordering / host differences don't
+// cause false misses. A Takeout download URL is unambiguously identified by
+// j=<jobId>&i=<partId> — no other query params matter for equality.
+function partKey(url) {
+  try {
+    const u = new URL(url);
+    const j = u.searchParams.get("j");
+    const i = u.searchParams.get("i");
+    if (j && i) return `${j}:${i}`;
+  } catch {}
+  return null;
+}
+
+function basename(path) {
+  if (!path) return "";
+  return path.split(/[\\/]/).pop() || path;
+}
+
+// Query Chrome's download history for completed Takeout parts that still
+// exist on disk, return a map of url -> saved-filename for the links we care
+// about. One search is enough: Chrome filters server-side by query term, we
+// filter the rest client-side.
+async function findCompletedDownloads(links) {
+  const completed = {};
+  if (!Array.isArray(links) || links.length === 0) return completed;
+
+  let results = [];
+  try {
+    results = await chrome.downloads.search({
+      query: ["takeout"],
+      state: "complete",
+      limit: 0, // no cap — users with huge histories still match
+    });
+  } catch {
+    return completed;
+  }
+
+  const byKey = new Map();
+  for (const r of results) {
+    if (r.exists === false) continue; // file was moved/deleted → don't skip
+    const url = r.url || "";
+    const finalUrl = r.finalUrl || "";
+    if (!DOWNLOAD_URL_RE.test(url) && !DOWNLOAD_URL_RE.test(finalUrl)) continue;
+    const key = partKey(url) || partKey(finalUrl);
+    if (!key) continue;
+    // search returns newest-first by default; first hit per key wins.
+    if (!byKey.has(key)) byKey.set(key, r.filename);
+  }
+
+  for (const link of links) {
+    const key = partKey(link.url);
+    if (!key) continue;
+    const filename = byKey.get(key);
+    if (filename) completed[link.url] = basename(filename);
+  }
+  return completed;
+}
+
+async function handleCheckCompleted(links, port) {
+  const completed = await findCompletedDownloads(links || []);
+  const payload = { type: "COMPLETED_INFO", completed };
+  const target = port || popupPort;
+  if (target) {
+    try { target.postMessage(payload); } catch {}
+  }
+}
+
 // --- queue control ---
 
-async function startDownloads(links, concurrency) {
+async function startDownloads(links, concurrency, options = {}) {
   if (state.running) return;
   if (!Array.isArray(links) || links.length === 0) return;
 
-  state.limit = clampConcurrency(concurrency);
-  state.items = links.map((l, idx) => ({
-    id: stableId(l.url, idx),
-    url: l.url,
-    filename: l.filename || null,
-    label: l.label || l.filename || l.url,
-    status: "queued",
-    attempts: 0,
-    lastReason: null,
-    downloadId: null,
-    tabId: null,
-    tabDeadline: null,
-    nextAttemptAt: 0,
-    lastBytes: 0,
-    stallTicks: 0,
-  }));
-  state.running = true;
+  // When skipCompleted is set, query download history and pre-mark items whose
+  // file is already on disk as complete so the run only attempts the rest.
+  // The completed items stay in state.items so the popup list shows the full
+  // batch at a glance (with ✓ on the skipped ones).
+  const completedMap = options.skipCompleted
+    ? await findCompletedDownloads(links)
+    : {};
 
-  await ensureWatchdog();
+  state.limit = clampConcurrency(concurrency);
+  state.items = links.map((l, idx) => {
+    const preCompletedName = completedMap[l.url] || null;
+    return {
+      id: stableId(l.url, idx),
+      url: l.url,
+      filename: preCompletedName || l.filename || null,
+      label: l.label || l.filename || l.url,
+      status: preCompletedName ? "complete" : "queued",
+      attempts: 0,
+      lastReason: preCompletedName ? "already downloaded" : null,
+      downloadId: null,
+      tabId: null,
+      tabDeadline: null,
+      nextAttemptAt: 0,
+      lastBytes: 0,
+      stallTicks: 0,
+    };
+  });
+  const hasWork = state.items.some((it) => it.status === "queued");
+  state.running = hasWork;
+  state.sessionProven = false;
+  state.authTabId = null;
+  state.authItemId = null;
+  state.authSince = null;
+
+  if (hasWork) await ensureWatchdog();
   await persistState();
-  pump();
+  if (hasWork) pump();
   broadcastProgress();
 }
 
 async function stopDownloads() {
   state.running = false;
+  // Close any gated auth tab as part of the stop. authTabId is either in
+  // state.items[*].tabId (if status===active) OR dangling if we flipped the
+  // item back to queued; cover both cases explicitly.
+  const gatedTabId = state.authTabId;
+  state.authTabId = null;
+  state.authItemId = null;
+  state.authSince = null;
+  state.sessionProven = false;
+  if (gatedTabId != null) {
+    try { await chrome.tabs.remove(gatedTabId); } catch {}
+  }
 
   const closures = [];
   for (const item of state.items) {
@@ -152,6 +261,8 @@ async function retryFailed() {
   }
   if (resurrected === 0) return;
   state.running = true;
+  // Re-probe on retry: session may have expired between runs.
+  state.sessionProven = false;
   await ensureWatchdog();
   await persistState();
   pump();
@@ -173,10 +284,16 @@ function readyQueue() {
   );
 }
 
+function effectiveConcurrency() {
+  if (state.authTabId != null) return 0;   // auth gate closed: dispatch nothing
+  if (!state.sessionProven) return 1;      // probing: serial until first download starts
+  return state.limit;
+}
+
 function pump() {
   if (!state.running) return;
   const ready = readyQueue();
-  let slots = state.limit - activeCount();
+  let slots = effectiveConcurrency() - activeCount();
   for (const item of ready) {
     if (slots <= 0) break;
     item.status = "active";
@@ -303,18 +420,128 @@ chrome.downloads.onCreated.addListener(async (dl) => {
   target.downloadId = dl.id;
   const tabId = target.tabId;
   target.tabId = null;
+
+  // A download actually starting is the trusted signal that session is valid.
+  // Close any open auth gate and flip sessionProven so pump() can go full
+  // concurrency.
+  const wasGated = state.authTabId === tabId;
+  if (wasGated || !state.sessionProven) {
+    state.authTabId = null;
+    state.authItemId = null;
+    state.authSince = null;
+    state.sessionProven = true;
+    for (const it of state.items) {
+      if (
+        it.lastReason === "queued behind auth" ||
+        it.lastReason === "waiting for password confirmation"
+      ) {
+        it.lastReason = null;
+      }
+    }
+  }
   await persistState();
   broadcastProgress();
 
   // Download is in flight; source tab is redundant. Chrome keeps downloading
   // after the tab closes.
   try { await chrome.tabs.remove(tabId); } catch {}
+
+  if (wasGated) pump(); // re-dispatch requeued items
 });
 
-// User manually closed a spawned tab before a download started. Fail fast
-// instead of waiting for the 90s tab-auth deadline.
+// Tab-URL change is the PRIMARY detector for auth redirects: any spawned tab
+// landing on accounts.google.com triggers the auth gate. tabs permission alone
+// is enough to receive `changeInfo.url`; no host permission needed.
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (!changeInfo.url) return;
+  if (!changeInfo.url.startsWith(AUTH_URL_PREFIX)) return;
+  await ensureRestored();
+  const item = state.items.find((it) => it.tabId === tabId);
+  if (!item) return;
+  await handleAuthRedirect(item);
+});
+
+async function handleAuthRedirect(item) {
+  // Gate already open on a DIFFERENT tab → this is a secondary auth-pending
+  // tab. Close it and requeue the item so only one auth prompt is visible.
+  if (state.authTabId != null && state.authTabId !== item.tabId) {
+    const tabId = item.tabId;
+    item.tabId = null;
+    item.tabDeadline = null;
+    item.status = "queued";
+    item.lastReason = "queued behind auth";
+    try { await chrome.tabs.remove(tabId); } catch {}
+    await persistState();
+    broadcastProgress();
+    return;
+  }
+  // Gate already open on THIS tab → sub-navigation inside accounts.google.com
+  // (2FA step, etc). No-op.
+  if (state.authTabId === item.tabId) return;
+
+  // Open the gate.
+  state.authTabId = item.tabId;
+  state.authItemId = item.id;
+  state.authSince = Date.now();
+  state.sessionProven = false;
+  item.lastReason = "waiting for password confirmation";
+  item.tabDeadline = null; // watchdog won't enforce deadline on gated tab
+
+  // Close every other tab still waiting for a download to start; requeue.
+  // Items whose download is already in flight (downloadId != null) are left
+  // alone — those keep progressing independent of their source tab.
+  const closures = [];
+  for (const other of state.items) {
+    if (other.id === item.id) continue;
+    if (other.status !== "active") continue;
+    if (other.tabId == null) continue;
+    if (other.downloadId != null) continue;
+    const tid = other.tabId;
+    other.tabId = null;
+    other.tabDeadline = null;
+    other.status = "queued";
+    other.lastReason = "queued behind auth";
+    closures.push(chrome.tabs.remove(tid).catch(() => {}));
+  }
+  await Promise.all(closures);
+
+  // Make the auth tab active + focus its window so the user can't miss it.
+  try {
+    await chrome.tabs.update(item.tabId, { active: true });
+    const tab = await chrome.tabs.get(item.tabId);
+    if (tab?.windowId != null) {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+  } catch {}
+
+  await persistState();
+  broadcastProgress();
+}
+
+// User manually closed a spawned tab. The auth-tab branch is first so we can
+// treat it as an explicit cancel (halt the run); other tab closures fail the
+// item fast instead of waiting 90s.
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await ensureRestored();
+
+  if (state.authTabId === tabId) {
+    const item = state.items.find((it) => it.id === state.authItemId);
+    state.authTabId = null;
+    state.authItemId = null;
+    state.authSince = null;
+    state.running = false;
+    if (item) {
+      item.tabId = null;
+      item.tabDeadline = null;
+      item.status = "queued";
+      item.lastReason = "auth cancelled";
+    }
+    try { await chrome.alarms.clear(WATCHDOG_ALARM); } catch {}
+    await persistState();
+    broadcastProgress();
+    return;
+  }
+
   const item = state.items.find((it) => it.tabId === tabId);
   if (!item) return;
   if (item.downloadId != null) return; // we closed it ourselves, expected
@@ -395,6 +622,22 @@ async function watchdogTick() {
   const now = Date.now();
   let dirty = false;
 
+  // 0. Enforce auth-gate timeout. If the user walks away without entering
+  // their password, close the auth tab and fail that item so the run can
+  // proceed (the next item will likely re-trigger the gate).
+  if (state.authTabId != null && state.authSince != null) {
+    if (now - state.authSince > AUTH_GATE_TIMEOUT_MS) {
+      const item = state.items.find((it) => it.id === state.authItemId);
+      const gatedTab = state.authTabId;
+      state.authTabId = null;
+      state.authItemId = null;
+      state.authSince = null;
+      try { await chrome.tabs.remove(gatedTab); } catch {}
+      if (item) await handleFailure(item, "auth timed out");
+      dirty = true;
+    }
+  }
+
   // 1. Reconcile active downloads + detect stalls.
   for (const item of state.items) {
     if (item.status !== "active" || item.downloadId == null) continue;
@@ -439,22 +682,23 @@ async function watchdogTick() {
   }
 
   // 2. Enforce tab-auth deadlines on tabs that never produced a download.
-  // If the tab is still on a Google accounts page the user is typing a password
-  // or confirming 2FA — extend once per tick instead of guillotining them.
+  // Safety net: if tabs.onUpdated missed the accounts.google.com redirect and
+  // the tab is sitting there when the deadline elapses, hand off to the auth
+  // gate instead of killing the tab.
   for (const item of state.items) {
     if (item.status !== "active") continue;
     if (item.downloadId != null) continue;
-    if (item.tabDeadline == null) continue;
+    if (item.tabDeadline == null) continue; // gated tab has null deadline
     if (now <= item.tabDeadline) continue;
+    if (item.tabId === state.authTabId) continue; // defensive
     if (item.tabId != null) {
       let tabUrl = "";
       try {
         const tab = await chrome.tabs.get(item.tabId);
         tabUrl = tab.url || tab.pendingUrl || "";
       } catch {}
-      if (tabUrl.startsWith("https://accounts.google.com/")) {
-        item.tabDeadline = now + TAB_AUTH_TIMEOUT_MS;
-        item.lastReason = "waiting for password";
+      if (tabUrl.startsWith(AUTH_URL_PREFIX)) {
+        await handleAuthRedirect(item);
         dirty = true;
         continue;
       }
@@ -504,6 +748,10 @@ function broadcastProgress(port) {
     queued: totals.queued + totals.retrying,
     retrying: totals.retrying,
     running: state.running,
+    auth:
+      state.authTabId != null
+        ? { waiting: true, sinceMs: Date.now() - (state.authSince ?? Date.now()) }
+        : null,
     items: state.items.map((it) => ({
       id: it.id,
       label: it.filename || it.label,
@@ -564,6 +812,10 @@ async function persistState() {
           limit: state.limit,
           items: state.items,
           running: state.running,
+          sessionProven: state.sessionProven,
+          authTabId: state.authTabId,
+          authItemId: state.authItemId,
+          authSince: state.authSince,
         },
       });
     } finally {
@@ -583,6 +835,10 @@ async function restoreState() {
   state.limit = stored.limit ?? 3;
   state.items = Array.isArray(stored.items) ? stored.items : [];
   state.running = stored.running ?? false;
+  state.sessionProven = stored.sessionProven ?? false;
+  state.authTabId = stored.authTabId ?? null;
+  state.authItemId = stored.authItemId ?? null;
+  state.authSince = stored.authSince ?? null;
 }
 
 function ensureRestored() {

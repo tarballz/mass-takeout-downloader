@@ -4,10 +4,13 @@ const concurrencyEl = document.getElementById("concurrency");
 const concurrencyValueEl = document.getElementById("concurrency-value");
 const startBtn = document.getElementById("start");
 const retryBtn = document.getElementById("retry-failed");
+const skipCompletedEl = document.getElementById("skip-completed");
 const progressEl = document.getElementById("progress-summary");
 const itemsEl = document.getElementById("items");
+const authBannerEl = document.getElementById("auth-banner");
 
 const CONCURRENCY_PREF_KEY = "concurrency";
+const SKIP_COMPLETED_PREF_KEY = "skipCompleted";
 
 const STATUS_ICON = {
   queued: "·",
@@ -18,27 +21,37 @@ const STATUS_ICON = {
 };
 
 let links = [];
+let completedMap = {}; // url -> saved filename
 let running = false;
 let port = null;
 
 init();
 
 async function init() {
-  await loadConcurrencyPref();
+  await loadPrefs();
   connectPort();
   await scanLinks();
 }
 
-async function loadConcurrencyPref() {
-  const stored = await chrome.storage.local.get(CONCURRENCY_PREF_KEY);
-  const value = stored[CONCURRENCY_PREF_KEY] ?? 3;
-  concurrencyEl.value = String(value);
-  concurrencyValueEl.textContent = String(value);
+async function loadPrefs() {
+  const stored = await chrome.storage.local.get([
+    CONCURRENCY_PREF_KEY,
+    SKIP_COMPLETED_PREF_KEY,
+  ]);
+  const concurrency = stored[CONCURRENCY_PREF_KEY] ?? 3;
+  concurrencyEl.value = String(concurrency);
+  concurrencyValueEl.textContent = String(concurrency);
+  skipCompletedEl.checked = stored[SKIP_COMPLETED_PREF_KEY] !== false;
 }
 
 concurrencyEl.addEventListener("input", () => {
   concurrencyValueEl.textContent = concurrencyEl.value;
   chrome.storage.local.set({ [CONCURRENCY_PREF_KEY]: Number(concurrencyEl.value) });
+});
+
+skipCompletedEl.addEventListener("change", () => {
+  chrome.storage.local.set({ [SKIP_COMPLETED_PREF_KEY]: skipCompletedEl.checked });
+  updateDetected();
 });
 
 rescanBtn.addEventListener("click", scanLinks);
@@ -52,6 +65,7 @@ startBtn.addEventListener("click", () => {
       type: "START_DOWNLOADS",
       links,
       concurrency: Number(concurrencyEl.value),
+      skipCompleted: skipCompletedEl.checked,
     });
   }
 });
@@ -62,7 +76,7 @@ retryBtn.addEventListener("click", () => {
 
 function connectPort() {
   port = chrome.runtime.connect({ name: "popup" });
-  port.onMessage.addListener(onProgress);
+  port.onMessage.addListener(onPortMessage);
   port.onDisconnect.addListener(() => {
     port = null;
   });
@@ -79,6 +93,7 @@ async function scanLinks() {
     tab?.url?.startsWith("https://takeout.google.com/settings/takeout/downloads");
   if (!onTakeout) {
     links = [];
+    completedMap = {};
     detectedEl.textContent = "Open takeout.google.com/manage to scan.";
     updateStartButton();
     return;
@@ -89,17 +104,43 @@ async function scanLinks() {
     response = await chrome.tabs.sendMessage(tab.id, { type: "SCAN_LINKS" });
   } catch (err) {
     links = [];
+    completedMap = {};
     detectedEl.textContent = "Couldn't reach the page — try reloading it.";
     updateStartButton();
     return;
   }
 
   links = Array.isArray(response?.links) ? response.links : [];
-  detectedEl.textContent =
-    links.length === 0
-      ? "No download links found on this page."
-      : `${links.length} archive part${links.length === 1 ? "" : "s"} found.`;
+  completedMap = {};
+  updateDetected();
   updateStartButton();
+
+  // Ask the SW to cross-reference scraped links against download history.
+  if (links.length > 0) {
+    port?.postMessage({ type: "CHECK_COMPLETED", links });
+  }
+}
+
+function updateDetected() {
+  const total = links.length;
+  if (total === 0) {
+    detectedEl.textContent = "No download links found on this page.";
+    return;
+  }
+  const completedCount = Object.keys(completedMap).filter((u) =>
+    links.some((l) => l.url === u),
+  ).length;
+  const parts = `${total} archive part${total === 1 ? "" : "s"} found`;
+  if (completedCount === 0) {
+    detectedEl.textContent = parts + ".";
+    return;
+  }
+  const remaining = total - completedCount;
+  const skip = skipCompletedEl.checked;
+  const suffix = skip
+    ? ` · ${completedCount} already downloaded, ${remaining} to go`
+    : ` · ${completedCount} already downloaded (will re-download)`;
+  detectedEl.textContent = parts + suffix;
 }
 
 function updateStartButton() {
@@ -114,11 +155,23 @@ function updateStartButton() {
   }
 }
 
-function onProgress(msg) {
-  if (msg?.type !== "PROGRESS") return;
+function onPortMessage(msg) {
+  if (msg?.type === "PROGRESS") {
+    onProgress(msg);
+    return;
+  }
+  if (msg?.type === "COMPLETED_INFO") {
+    completedMap = msg.completed || {};
+    updateDetected();
+    return;
+  }
+}
 
+function onProgress(msg) {
   running = !!msg.running;
   updateStartButton();
+
+  authBannerEl.hidden = !msg.auth?.waiting;
 
   if (msg.total === 0) {
     progressEl.textContent = "Idle";
@@ -162,7 +215,10 @@ function renderItems(items) {
       li.appendChild(attempts);
     }
 
-    if (it.lastReason && (it.status === "failed" || it.status === "retrying")) {
+    if (
+      it.lastReason &&
+      (it.status === "failed" || it.status === "retrying" || it.status === "complete")
+    ) {
       const reason = document.createElement("span");
       reason.className = "reason";
       reason.textContent = it.lastReason;

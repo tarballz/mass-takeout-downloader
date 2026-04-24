@@ -22,13 +22,15 @@ Then:
 ## Use
 
 1. Open your Takeout exports at <https://takeout.google.com/manage>
-2. Click the extension icon — the popup shows how many archive parts it detected
+2. Click the extension icon — the popup shows how many archive parts it detected and how many you've already downloaded
 3. Pick concurrency (1–5, default 3) and click **Start**
 4. Files land in your default Chrome downloads folder
 
 Click **Stop** to cancel in-flight downloads and drain the queue.
 
-**First run / password prompts**: each archive part opens briefly in a background tab. If Google wants you to confirm your password, one of those tabs will show the prompt — enter your password there and the rest of the queue should go through without prompting, since the session cookie carries across.
+**Resume after interruption**: with _Skip already-downloaded parts_ checked (the default), the extension cross-references your Chrome download history before a run and auto-skips any part whose file is still on disk. If something crashes mid-batch, just click **Start** again — it'll pick up where it left off without re-downloading the parts you already have. Files moved or deleted outside Chrome are re-downloaded.
+
+**First run / password prompts**: when the extension isn't sure the session is valid, it opens tabs one at a time (probe mode). The moment a download actually starts, it switches to full concurrency. If Google asks you to re-enter your password, the extension detects the redirect to `accounts.google.com`, auto-focuses that tab, and closes any other sibling tabs that were also pending auth (their items go back to the queue with a "queued behind auth" note). You only confirm your password once; then the queue resumes at the configured concurrency. Closing the auth tab halts the run — click **Start** again to resume.
 
 ## How it works
 
