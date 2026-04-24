@@ -418,13 +418,11 @@ chrome.downloads.onCreated.addListener(async (dl) => {
   if (!target) return;
 
   target.downloadId = dl.id;
-  const tabId = target.tabId;
-  target.tabId = null;
 
   // A download actually starting is the trusted signal that session is valid.
   // Close any open auth gate and flip sessionProven so pump() can go full
   // concurrency.
-  const wasGated = state.authTabId === tabId;
+  const wasGated = state.authTabId === target.tabId;
   if (wasGated || !state.sessionProven) {
     state.authTabId = null;
     state.authItemId = null;
@@ -442,9 +440,14 @@ chrome.downloads.onCreated.addListener(async (dl) => {
   await persistState();
   broadcastProgress();
 
-  // Download is in flight; source tab is redundant. Chrome keeps downloading
-  // after the tab closes.
-  try { await chrome.tabs.remove(tabId); } catch {}
+  // DELIBERATELY don't close the tab here. onCreated fires as soon as Chrome
+  // registers the download in its manager, BEFORE the download is fully
+  // "adopted" by the downloads service. Closing the initiating tab at that
+  // exact moment can race with adoption and cause Chrome to abort the
+  // download, surfacing as an erroneous USER_CANCELED. Instead, the onChanged
+  // handler closes the tab once real progress is observed (bytesReceived or a
+  // state transition) — by that point the download is guaranteed live and
+  // tab closure is safe.
 
   if (wasGated) pump(); // re-dispatch requeued items
 });
@@ -554,6 +557,22 @@ chrome.downloads.onChanged.addListener(async (delta) => {
 
   const item = state.items.find((it) => it.downloadId === delta.id);
   if (!item) return;
+
+  // Close the initiating tab the first time Chrome reports real progress or a
+  // state change for this download. At this point Chrome has fully adopted
+  // the download, so closing the tab can't cancel it. See onCreated comment
+  // for why we delay instead of closing there.
+  if (
+    item.tabId != null &&
+    (delta.bytesReceived != null ||
+      delta.state?.current === "in_progress" ||
+      delta.state?.current === "complete" ||
+      delta.state?.current === "interrupted")
+  ) {
+    const tabId = item.tabId;
+    item.tabId = null;
+    chrome.tabs.remove(tabId).catch(() => {});
+  }
 
   if (delta.state?.current === "complete") {
     let info;
@@ -670,11 +689,21 @@ async function watchdogTick() {
         item.lastBytes = received;
         item.stallTicks = 0;
         dirty = true;
-      } else if (total > 0 && received < total) {
+      } else if (received > 0 && total > 0 && received < total && !info.paused) {
+        // Only count as stalled if the download has actually started
+        // receiving bytes. A download with bytesReceived === 0 may be queued
+        // by Chrome behind others (per-host connection limit is 6), and
+        // could legitimately sit at 0 for a while before getting its turn —
+        // don't cancel it.
         item.stallTicks = (item.stallTicks || 0) + 1;
         dirty = true;
         if (item.stallTicks >= STALL_WINDOW_TICKS) {
-          try { await chrome.downloads.cancel(item.downloadId); } catch {}
+          // Null downloadId BEFORE canceling so the resulting onChanged
+          // USER_CANCELED event can't race against our handleFailure call
+          // and overwrite "stalled" with "USER_CANCELED" / permanent-failed.
+          const downloadId = item.downloadId;
+          item.downloadId = null;
+          try { await chrome.downloads.cancel(downloadId); } catch {}
           await handleFailure(item, "stalled");
         }
       }
