@@ -8,9 +8,9 @@ Google Takeout splits big exports into many archive parts (50+ is common) and ma
 
 ```bash
 git clone https://github.com/tarballz/mass-takeout-downloader.git
-cd mass-takeout-downloader
-uv run --with pillow python scripts/make_icons.py   # generate toolbar icons
 ```
+
+Or download the [latest release](https://github.com/tarballz/mass-takeout-downloader/releases/latest) source zip and extract it.
 
 Then:
 
@@ -18,6 +18,8 @@ Then:
 2. Enable **Developer mode** (top right)
 3. Click **Load unpacked** and pick the repo folder
 4. Pin the extension to your toolbar
+
+Icons ship in the repo (`icons/`) — no build step is required. If you want to regenerate them (e.g. after editing `scripts/make_icons.py`), run `uv run --with pillow python scripts/make_icons.py`.
 
 ## Use
 

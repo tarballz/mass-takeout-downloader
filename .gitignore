@@ -27,9 +27,6 @@ __pycache__/
 *.crx
 *.pem
 
-# Generated icons (run scripts/make_icons.py to regenerate)
-icons/
-
 # Local session memory / scratch
 .remember/
 
